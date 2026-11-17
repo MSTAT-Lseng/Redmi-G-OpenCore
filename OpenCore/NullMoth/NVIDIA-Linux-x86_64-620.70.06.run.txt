@@ -1,0 +1,7 @@
+为了节省 GitHub 仓库的空间，请你手动下载
+
+https://download.nvidia.com/XFree86/Linux-x86_64/620.70.06/NVIDIA-Linux-x86_64-620.70.06.run
+
+到本文件夹下，并命名为
+
+NVIDIA-Linux-x86_64-620.70.06.run
