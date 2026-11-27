@@ -1,0 +1,128 @@
+--- a/kext/IntelSSTDMIC/LiluGlue.cpp
++++ b/kext/IntelSSTDMIC/LiluGlue.cpp
+@@ -30,7 +30,21 @@
+ };
+ 
+ static void appleHDALoaded(void *, KernelPatcher &patcher, size_t id, mach_vm_address_t address, size_t size) {
+-    HookManager::status().kextCb++;
++    auto &status = HookManager::status();
++    status.kextCb++;
++    status.expectedKextId = static_cast<uint32_t>(appleHDAInfo.loadIndex);
++    // Lilu broadcasts monitored kext events to every registered callback.
++    if (id != appleHDAInfo.loadIndex) {
++        status.ignoredKextCb++;
++        return;
++    }
++    status.targetKextCb++;
++    // Lilu updates the running image before broadcasting; preserve that error.
++    status.runningInfoError = static_cast<uint32_t>(patcher.getError());
++    IOLog("IntelSSTDMIC: matched AppleHDA id %lu address %llx size %lu\n",
++          static_cast<unsigned long>(id), static_cast<unsigned long long>(address),
++          static_cast<unsigned long>(size));
++    patcher.clearError();
+     HookManager::install(patcher, id, address, size);
+ }
+ 
+--- a/kext/IntelSSTDMIC/HookManager.cpp
++++ b/kext/IntelSSTDMIC/HookManager.cpp
+@@ -29,8 +29,20 @@
+     routeStatus.kextSize = (uint32_t)size;
+     routeStatus.kextAddr = address;
+ 
++    const char *symbols[] = {kConvertInputSymbol, kInitHardwareSymbol,
++        kPerformStartSymbol, kPerformStopSymbol, kStopHardwareSymbol, kFormatChangeSymbol};
++    routeStatus.symbolMask = 0;
++    for (unsigned i = 0; i < 6; ++i) {
++        patcher.clearError();
++        routeStatus.symbolAddresses[i] = patcher.solveSymbol(kextId, symbols[i]);
++        routeStatus.symbolErrors[i] = static_cast<uint32_t>(patcher.getError());
++        if (routeStatus.symbolAddresses[i]) routeStatus.symbolMask |= 1u << i;
++        patcher.clearError();
++    }
++
+     // Diagnostic: resolve the data symbol directly. On kernel-collection boots the callback's
+     // address/size range is not always a valid symbol search range.
++    patcher.clearError();
+     mach_vm_address_t solved = patcher.solveSymbol(kextId, kConvertInputSymbol);
+     routeStatus.solveError = (uint32_t)patcher.getError();
+     patcher.clearError();
+@@ -38,19 +50,13 @@
+     routeStatus.solveAddr = solved;
+ 
+     auto tryRoute = [&](KernelPatcher::RouteRequest &request) -> bool {
+-        bool ok = patcher.routeMultiple(kextId, &request, 1, address, size);
++        // The callback now guarantees the correct kext index. Use Lilu's
++        // symbol table directly, without a callback-size range assertion that
++        // can panic before a fallback is reached on dynamically linked images.
++        patcher.clearError();
++        bool ok = patcher.routeMultiple(kextId, &request, 1);
+         uint32_t err = (uint32_t)patcher.getError();
+         patcher.clearError();
+-        if (!ok) {
+-            ok = patcher.routeMultiple(kextId, &request, 1);
+-            err = (uint32_t)patcher.getError();
+-            patcher.clearError();
+-        }
+-        if (!ok) {
+-            ok = patcher.routeMultiple(kextId, &request, 1, 0, 0, true, true);
+-            err = (uint32_t)patcher.getError();
+-            patcher.clearError();
+-        }
+         routeStatus.convertError = err;
+         return ok;
+     };
+--- a/kext/IntelSSTDMIC/HookManager.hpp
++++ b/kext/IntelSSTDMIC/HookManager.hpp
+@@ -18,6 +18,10 @@
+         uint32_t kmodEntry {0}, reqAccess {0}, shouldLoad {0}, started {0};
+         uint32_t arg {0}, onKextErr {0}, kextCb {0}, routeOk {0};
+         uint32_t convertError {0}, engineError {0};
++        uint32_t ignoredKextCb {0}, expectedKextId {0}, targetKextCb {0};
++        uint32_t runningInfoError {0}, symbolMask {0};
++        uint32_t symbolErrors[6] {};
++        uint64_t symbolAddresses[6] {};
+         uint32_t kextId {0}, kextSize {0}, solveOk {0}, solveError {0};
+         uint64_t kextAddr {0}, solveAddr {0};
+         // bit0 init, bit1 performStart, bit2 performStop, bit3 stopHardware, bit4 format
+--- a/kext/IntelSSTDMIC/IntelDspAudioEngine.cpp
++++ b/kext/IntelSSTDMIC/IntelDspAudioEngine.cpp
+@@ -127,7 +127,15 @@
+ bool IntelDspAudioEngine::isInternalMicEngine(IOService *self) const {
+     if (!self) return false;
+     OSString *desc = OSDynamicCast(OSString, self->getProperty("IOAudioEngineDescription"));
+-    return desc && desc->isEqualTo("DevShortNameIMic");
++    if (desc && desc->isEqualTo("DevShortNameIMic")) return true;
++    // SimpleHDA localizes setDescription at KXLD import binding time.
++    // Do not match translated labels: use AppleHDA's semantic input metadata.
++    // ownsEngine() additionally constrains the engine to our PCI device ancestry.
++    OSDictionary *deviceDesc = OSDynamicCast(OSDictionary,
++        self->getProperty("IOAudioEngineDeviceDescription"));
++    if (!deviceDesc) return false;
++    OSNumber *micCount = OSDynamicCast(OSNumber, deviceDesc->getObject("num-internal-mics"));
++    return micCount && micCount->unsigned32BitValue() > 0;
+ }
+ 
+ bool IntelDspAudioEngine::isAlive() const {
+--- a/kext/IntelSSTDMIC/IntelSSTDMIC.cpp
++++ b/kext/IntelSSTDMIC/IntelSSTDMIC.cpp
+@@ -416,6 +416,20 @@
+     setProperty("HookArg", HookManager::status().arg, 32);
+     setProperty("HookOnKextErr", HookManager::status().onKextErr, 32);
+     setProperty("HookKextCb", HookManager::status().kextCb, 32);
++    setProperty("HookExpectedKextId", HookManager::status().expectedKextId, 32);
++    setProperty("HookTargetKextCb", HookManager::status().targetKextCb, 32);
++    setProperty("HookIgnoredKextCb", HookManager::status().ignoredKextCb, 32);
++    setProperty("CompatibilityBuild", "simplehda-diagnostic-1");
++    setProperty("HookRunningInfoError", HookManager::status().runningInfoError, 32);
++    setProperty("HookSymbolMask", HookManager::status().symbolMask, 32);
++    const char *symbolNames[] = {"Convert", "Init", "Start", "Stop", "StopHardware", "Format"};
++    for (unsigned i = 0; i < 6; ++i) {
++        char key[48];
++        snprintf(key, sizeof(key), "HookSymbol%sAddress", symbolNames[i]);
++        setProperty(key, HookManager::status().symbolAddresses[i], 64);
++        snprintf(key, sizeof(key), "HookSymbol%sError", symbolNames[i]);
++        setProperty(key, HookManager::status().symbolErrors[i], 32);
++    }
+     setProperty("HookRouteOk", HookManager::status().routeOk, 32);
+     setProperty("HookRouteEngine", HookManager::status().routeEngine, 32);
+     setProperty("HookConvertError", HookManager::status().convertError, 32);
